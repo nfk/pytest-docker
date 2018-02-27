@@ -9,24 +9,10 @@ import subprocess
 import time
 import timeit
 
-
-def execute(command, success_codes=(0,)):
-    """Run a shell command."""
-    try:
-        output = subprocess.check_output(
-            command, stderr=subprocess.STDOUT, shell=True,
-        )
-        status = 0
-    except subprocess.CalledProcessError as error:
-        output = error.output or b''
-        status = error.returncode
-        command = error.cmd
-    output = output.decode('utf-8')
-    if status not in success_codes:
-        raise Exception(
-            'Command %r returned %d: """%s""".' % (command, status, output)
-        )
-    return output
+from compose.cli.main import TopLevelCommand
+from compose.cli.main import project_from_options
+from inspect import getdoc
+from docopt import docopt
 
 
 @pytest.fixture(scope='session')
@@ -54,36 +40,24 @@ class Services(object):
     _docker_compose = attr.ib()
     _docker_allow_fallback = attr.ib(default=False)
 
-    _services = attr.ib(init=False, default=attr.Factory(dict))
-
-    def port_for(self, service, port):
+    def port_for(self, service, port, protocol='tcp'):
         """Get the effective bind port for a service."""
 
         # Return the container port if we run in no Docker mode.
         if self._docker_allow_fallback:
             return port
 
-        # Lookup in the cache.
-        cache = self._services.get(service, {}).get(port, None)
-        if cache is not None:
-            return cache
+        docker_service = self._docker_compose.get_service(service)
+        container = docker_service.get_container()
 
-        output = self._docker_compose.execute(
-            'port %s %d' % (service, port,)
-        )
-        endpoint = output.strip()
-        if not endpoint:
+        docker_port = '{}/{}'.format(port, protocol)
+        ports = container.ports.get(docker_port)
+        if ports is None or len(ports) != 1:
             raise ValueError(
                 'Could not detect port for "%s:%d".' % (service, port)
             )
 
-        # Usually, the IP address here is 0.0.0.0, so we don't use it.
-        match = int(endpoint.split(':', 1)[1])
-
-        # Store it in cache in case we request it multiple times.
-        self._services.setdefault(service, {})[port] = match
-
-        return match
+        return int(ports[0]['HostPort'])
 
     def wait_until_responsive(self, check, timeout, pause,
                               clock=timeit.default_timer):
@@ -112,13 +86,20 @@ def str_to_list(arg):
 class DockerComposeExecutor(object):
     _compose_files = attr.ib(convert=str_to_list)
     _compose_project_name = attr.ib()
+    _compose_project_dir = attr.ib()
 
-    def execute(self, subcommand):
-        command = "docker-compose"
-        for compose_file in self._compose_files:
-            command += ' -f "{}"'.format(compose_file)
-        command += ' -p "{}" {}'.format(self._compose_project_name, subcommand)
-        return execute(command)
+    def as_dict_options(self):
+        return {
+            '--file': self._compose_files,
+            '--project-dir': self._compose_project_dir,
+            '--project-name': self._compose_project_name
+        }
+
+    def defaults_opts(self, command):
+        """ Retrieve all options with default value of docker compose command
+        """
+        cmd_help = getdoc(getattr(TopLevelCommand, command))
+        return docopt(cmd_help, [])
 
 
 @pytest.fixture(scope='session')
@@ -132,6 +113,19 @@ def docker_compose_file(pytestconfig):
         str(pytestconfig.rootdir),
         'tests',
         'docker-compose.yml'
+    )
+
+
+@pytest.fixture(scope='session')
+def docker_compose_project_dir(pytestconfig):
+    """Get the docker compose project directory absolute path.
+
+    Override this fixture in your tests if you need a custom location.
+
+    """
+    return os.path.join(
+        str(pytestconfig.rootdir),
+        'tests'
     )
 
 
@@ -157,35 +151,51 @@ def docker_allow_fallback():
 
 @pytest.fixture(scope='session')
 def docker_services(
-    docker_compose_file, docker_allow_fallback, docker_compose_project_name
+    docker_compose_file, docker_allow_fallback, docker_compose_project_name,
+    docker_compose_project_dir
 ):
     """Ensure all Docker-based services are up and running."""
 
     docker_compose = DockerComposeExecutor(
-        docker_compose_file, docker_compose_project_name
+        docker_compose_file,
+        docker_compose_project_name,
+        docker_compose_project_dir
     )
 
     # If we allowed to run without Docker, check it's presence
     if docker_allow_fallback is True:
         try:
-            execute('docker ps')
+            with open(os.devnull, 'w') as devnull:
+                subprocess.call(['docker', 'ps'],
+                                stdout=devnull, stderr=devnull)
         except Exception:
-            # Run against localhost
-            yield Services(docker_compose, docker_allow_fallback=True)
+            yield Services(None, docker_allow_fallback=True)
             return
 
+    project = project_from_options(
+        docker_compose._compose_project_dir,
+        options=docker_compose.as_dict_options()
+    )
+    cmd = TopLevelCommand(project)
+
     # Spawn containers.
-    docker_compose.execute('up --build -d')
+    up_options = docker_compose.defaults_opts('up')
+    up_options['-d'] = True
+    up_options['--build'] = True
+    cmd.up(up_options)
 
     # Let test(s) run.
-    yield Services(docker_compose)
+    yield Services(project)
 
     # Clean up.
-    docker_compose.execute('down -v')
+    down_option = docker_compose.defaults_opts('down')
+    down_option['-v'] = True
+    cmd.down(down_option)
 
 
 __all__ = (
     'docker_compose_file',
+    'docker_compose_project_dir',
     'docker_ip',
     'docker_services',
 )
